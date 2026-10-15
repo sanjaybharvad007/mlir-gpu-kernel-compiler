@@ -1,0 +1,33 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install triton pytest ruff -e .
+      - run: ruff check .
+      - run: pytest -q                       # C backend, MLIR emission, torch.compile backend
+      - run: TRITON_INTERPRET=1 pytest -q tests/test_backends.py -k triton   # Triton codegen via interpreter
+  mlir:
+    # Full MLIR lowering + execution needs an LLVM/MLIR toolchain.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: |
+          sudo apt-get update && sudo apt-get install -y lsb-release wget software-properties-common gnupg
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          sudo apt-get install -y mlir-18-tools clang-18
+          sudo ln -sf /usr/lib/llvm-18/bin/mlir-opt /usr/local/bin/mlir-opt
+          sudo ln -sf /usr/lib/llvm-18/bin/mlir-translate /usr/local/bin/mlir-translate
+          sudo ln -sf /usr/lib/llvm-18/bin/clang /usr/local/bin/clang
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install pytest -e .
+      - run: pytest -q tests/test_mlir_and_torch.py
