@@ -1,0 +1,21 @@
+name: mlir
+# Full MLIR lowering + execution needs an LLVM/MLIR toolchain (~10 min install); run manually.
+on:
+  workflow_dispatch:
+
+jobs:
+  mlir:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: |
+          sudo apt-get update && sudo apt-get install -y lsb-release wget software-properties-common gnupg
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          sudo apt-get install -y mlir-18-tools clang-18
+          sudo ln -sf /usr/lib/llvm-18/bin/mlir-opt /usr/local/bin/mlir-opt
+          sudo ln -sf /usr/lib/llvm-18/bin/mlir-translate /usr/local/bin/mlir-translate
+          sudo ln -sf /usr/lib/llvm-18/bin/clang /usr/local/bin/clang
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install pytest -e .
+      - run: pytest -q tests/test_mlir_and_torch.py
