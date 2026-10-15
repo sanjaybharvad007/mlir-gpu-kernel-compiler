@@ -11,7 +11,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python }}" }
       - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: pip install triton pytest ruff -e .
+      - run: pip install numpy triton pytest ruff -e .
       - run: ruff check .
-      - run: pytest -q                       # C backend, MLIR emission, torch.compile backend
-      - run: TRITON_INTERPRET=1 pytest -q tests/test_backends.py -k triton   # Triton codegen via interpreter
+      - run: pytest -q -rfE --tb=short       # C backend, MLIR emission, torch.compile backend
+      - run: TRITON_INTERPRET=1 pytest -q -rfE --tb=short tests/test_backends.py -k triton   # Triton codegen via interpreter
