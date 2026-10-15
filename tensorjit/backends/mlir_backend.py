@@ -190,7 +190,8 @@ class _Emitter:
         t = n.dtype.mlir
         if n.attrs.get("trans_b"):
             # Re-materialise the transpose; MLIR's own fusion/bufferization handles it.
-            from ..ir import Node as _N, TensorType as _T
+            from ..ir import Node as _N
+            from ..ir import TensorType as _T
             r = b.type.rank
             perm = tuple(range(r - 2)) + (r - 1, r - 2)
             tmp = _N("transpose", [], _T(tuple(b.shape[p] for p in perm), b.dtype), attrs={"perm": perm})

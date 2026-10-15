@@ -16,8 +16,33 @@ shape-specialised kernels, with autotuned matmul tiles.
 """
 from .compiler import JitFunction, compile_graph, jit, lower, pick_backend
 from .frontend.tracer import (
-    Tensor, abs, broadcast_to, exp, gelu, layer_norm, linear, log, matmul, max, maximum, mean, minimum,
-    permute, relu, reshape, rms_norm, rsqrt, sigmoid, silu, softmax, sqrt, sum, tanh, trace, transpose, where,
+    Tensor,
+    abs,
+    broadcast_to,
+    exp,
+    gelu,
+    layer_norm,
+    linear,
+    log,
+    matmul,
+    max,
+    maximum,
+    mean,
+    minimum,
+    permute,
+    relu,
+    reshape,
+    rms_norm,
+    rsqrt,
+    sigmoid,
+    silu,
+    softmax,
+    sqrt,
+    sum,
+    tanh,
+    trace,
+    transpose,
+    where,
 )
 from .ir import DType, Graph, Node, TensorType
 

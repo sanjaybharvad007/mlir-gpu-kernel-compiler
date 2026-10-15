@@ -20,7 +20,13 @@ import triton
 from ..ir import DType, Node
 from ..passes import Kernel, Program
 from ..runtime import (
-    TRITON_CANDIDATES, AutotuneStore, CompiledProgram, MatmulConfig, autotune, cache_dir, content_hash,
+    TRITON_CANDIDATES,
+    AutotuneStore,
+    CompiledProgram,
+    MatmulConfig,
+    autotune,
+    cache_dir,
+    content_hash,
     cost_model,
 )
 from .common import access_strides, contiguous_strides, decompose, emit_expr, index_expr
