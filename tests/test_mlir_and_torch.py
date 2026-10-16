@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 
 import pytest
 import torch
@@ -103,3 +104,36 @@ def test_torch_compile_functional_graph(monkeypatch):
     c = torch.compile(f, backend=tj.torch_compile_backend)
     torch.testing.assert_close(c(x, w), f(x, w), atol=1e-4, rtol=1e-4)
     assert os.environ.get("TENSORJIT_STRICT") == "1"
+
+
+def test_tj_dialect_emission_collapses_composites():
+    s = emit_mlir(
+        tj.trace(lambda x, g, w, b: tj.softmax(tj.gelu(tj.linear(tj.layer_norm(x, g), w, b))),
+                 [TensorType((4, 8)), TensorType((8,)), TensorType((6, 8)), TensorType((6,))]),
+        dialect="tj",
+    )
+    assert "tj.layer_norm %arg0 weight %arg1" in s
+    assert "tj.fused_matmul" in s and "#tj<epilogue gelu>" in s and "trans_b = true" in s
+    assert "tj.softmax" in s
+    assert "linalg.matmul" not in s and "math.erf" not in s      # fully collapsed
+
+
+def test_tj_dialect_falls_back_when_internal_value_escapes():
+    def f(x):
+        m = tj.max(x, keepdim=True)
+        y = tj.softmax(x)
+        return y, m                       # softmax's internal max is also returned -> cannot collapse
+    # after CSE the explicit max and softmax's internal max are one node with an external user
+    s = emit_mlir(optimize(tj.trace(f, [TensorType((4, 8))])), dialect="tj")
+    assert "tj.softmax" not in s and "linalg.generic" in s
+
+
+@pytest.mark.skipif(shutil.which("tj-opt") is None, reason="needs the C++ dialect built (mlir/)")
+def test_tj_opt_lowers_emitted_dialect(tmp_path):
+    s = emit_mlir(tj.trace(lambda x, w, b: tj.gelu(tj.linear(tj.softmax(x), w, b)),
+                           [TensorType((4, 8)), TensorType((6, 8)), TensorType((6,))]), dialect="tj")
+    p = tmp_path / "t.mlir"
+    p.write_text(s)
+    r = subprocess.run(["tj-opt", str(p), "--tj-lower-to-linalg", "--verify-each"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "tj." not in r.stdout and "linalg.matmul" in r.stdout

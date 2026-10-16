@@ -347,8 +347,15 @@ class _Emitter:
         return "\n".join(["module {", head, *self.lines, ret, "  }", "}"]) + "\n"
 
 
-def emit_mlir(graph: Graph) -> str:
-    """Lower an (optimised) tensorjit graph to MLIR linalg-on-tensors text."""
+def emit_mlir(graph: Graph, dialect: str = "linalg") -> str:
+    """Lower a tensorjit graph to MLIR text.
+
+    dialect="linalg": every op expanded to linalg/tensor/arith/math (default).
+    dialect="tj":     composites (softmax, layer_norm, rms_norm, linear+activation)
+                      emitted as `tj.*` ops of the C++ dialect in mlir/.
+    """
+    if dialect == "tj":
+        return _TjEmitter(graph).run()
     return _Emitter(graph).run()
 
 
@@ -461,3 +468,135 @@ def compile_program(program: Program) -> CompiledProgram:
 
 
 __all__ = ["emit_mlir", "run_pipeline", "verify", "toolchain_available", "compile_program", "MLIR_PIPELINE"]
+
+
+# ----------------------------------------------------------------------------
+# `tj` dialect emission (see mlir/ for the C++ dialect, tj-fuse and tj-lower-to-linalg)
+# ----------------------------------------------------------------------------
+
+_ACTIVATIONS = {"gelu": "gelu", "relu": "relu", "silu": "silu"}
+
+
+def _composite_internals(root: Node, args: list[Node], outputs: set[int] = frozenset()) -> set[int] | None:
+    """Node ids strictly inside the composite (reachable from root without
+    crossing its arguments).  None if any internal value escapes, in which case
+    the composite cannot be collapsed into one op."""
+    stop = {id(a) for a in args}
+    internal: set[int] = set()
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        for i in n.inputs:
+            if id(i) in stop or i.op in ("input", "const") or id(i) in internal:
+                continue
+            internal.add(id(i))
+            stack.append(i)
+    # every internal node must be used only by internal nodes or the root
+    allowed = internal | {id(root)}
+    return internal if all(
+        id(m) not in outputs and all(id(u) in allowed for u in m.users) for m in _nodes_by_id(root, internal)
+    ) else None
+
+
+def _nodes_by_id(root: Node, ids: set[int]) -> list[Node]:
+    out, stack, seen = [], [root], set()
+    while stack:
+        n = stack.pop()
+        for i in n.inputs:
+            if id(i) in ids and id(i) not in seen:
+                seen.add(id(i))
+                out.append(i)
+                stack.append(i)
+    return out
+
+
+class _TjEmitter(_Emitter):
+    """Emits composite roots as tj.* ops and everything else as linalg."""
+
+    def _plan(self):
+        g = self.g
+        skip: set[int] = set()
+        roots: dict[int, dict] = {}
+        outputs = {id(o) for o in g.outputs}
+        for n in g.nodes:
+            comp = n.meta.get("composite")
+            if not comp:
+                continue
+            internals = _composite_internals(n, comp["args"], outputs)
+            if internals is None:
+                continue
+            info = dict(comp)
+            info["root"] = n
+            # linear + activation (single use) -> fused_matmul with epilogue
+            if comp["op"] == "linear" and len(n.users) == 1 and n.users[0].op in _ACTIVATIONS \
+                    and n not in g.outputs:
+                act = n.users[0]
+                internals = internals | {id(n)}
+                info["epilogue"] = _ACTIVATIONS[act.op]
+                info["root"] = act
+                n = act
+            skip |= internals
+            roots[id(n)] = info
+        return skip, roots
+
+    def tj_op(self, info: dict) -> None:
+        n = info["root"]
+        args = info["args"]
+        t = n.dtype.mlir
+        out = self.fresh("tj")
+        names = [self.names[id(a)] for a in args]
+        types = [_ty(a) for a in args]
+        op = info["op"]
+        if op == "softmax":
+            self.emit(f"{out} = tj.softmax {names[0]} : {_ty(n)}")
+        elif op == "layer_norm":
+            w = f" weight {names[1]}" if info.get("has_weight") else ""
+            b = f" bias {names[2 if info.get('has_weight') else 1]}" if info.get("has_bias") else ""
+            self.emit(f"{out} = tj.layer_norm {names[0]}{w}{b} {{eps = {info['eps']:.6e} : {t}}} "
+                      f": ({', '.join(types)}) -> {_ty(n)}")
+        elif op == "rms_norm":
+            w = f" weight {names[1]}" if info.get("has_weight") else ""
+            self.emit(f"{out} = tj.rms_norm {names[0]}{w} {{eps = {info['eps']:.6e} : {t}}} "
+                      f": ({', '.join(types)}) -> {_ty(n)}")
+        elif op == "linear":
+            b = f" bias {names[2]}" if info.get("has_bias") else ""
+            epi = info.get("epilogue", "none")
+            self.emit(f"{out} = tj.fused_matmul {names[0]}, {names[1]}{b} "
+                      f"{{epilogue = #tj<epilogue {epi}>, trans_b = true}} : ({', '.join(types)}) -> {_ty(n)}")
+        else:
+            raise NotImplementedError(op)
+        self.names[id(n)] = out
+
+    def run(self) -> str:
+        g = self.g
+        skip, roots = self._plan()
+        for i, n in enumerate(g.inputs):
+            self.names[id(n)] = f"%arg{i}"
+        for n in g.nodes:
+            if n.kind in (OpKind.INPUT, OpKind.CONST) or id(n) in skip:
+                continue
+            if id(n) in roots:
+                self.tj_op(roots[id(n)])
+            elif n.kind == OpKind.ELEMENTWISE:
+                self.elementwise(n)
+            elif n.kind == OpKind.MATMUL:
+                self.matmul(n)
+            elif n.kind == OpKind.REDUCE:
+                self.reduce(n)
+            elif n.kind == OpKind.MOVEMENT:
+                self.movement(n)
+        for o in g.outputs:
+            if id(o) not in self.names:
+                self.names[id(o)] = self.scalar_const(o.attrs["value"], o.dtype.mlir)
+        args = ", ".join(f"%arg{i}: {_ty(n)}" for i, n in enumerate(g.inputs))
+        rets = ", ".join(_ty(o) for o in g.outputs)
+        head = f"  func.func @{g.name}({args}) -> ({rets}) attributes {{llvm.emit_c_interface}} {{"
+        ret = f"    return {', '.join(self.names[id(o)] for o in g.outputs)} : {rets}"
+        return "\n".join(["module {", head, *self.lines, ret, "  }", "}"]) + "\n"
+
+
+def emit_mlir_tj(graph: Graph) -> str:
+    """Emit MLIR using the `tj` dialect for composites (softmax, layer_norm,
+    rms_norm, linear[+activation]) and linalg for everything else.  Feed the
+    result to ``tj-opt --tj-lower-to-linalg`` (see mlir/)."""
+    return _TjEmitter(graph).run()
