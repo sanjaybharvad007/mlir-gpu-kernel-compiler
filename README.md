@@ -1,14 +1,17 @@
 # mlir-gpu-kernel-compiler (tensorjit)
 
 A JIT tensor compiler, written to understand what `torch.compile` / Inductor /
-XLA do under the hood. Traces tensor programs into an SSA IR, optimises and
-**fuses** them, and generates **shape-specialised** kernels for three backends:
+XLA / TensorRT do under the hood. Traces tensor programs into an SSA IR,
+optimises and **fuses** them, plans memory statically, and generates
+**shape-specialised** kernels for four backends, executed by a C++ runtime or
+as a single CUDA graph:
 
 | Backend | Target | Codegen | Status |
 |---|---|---|---|
-| `c` | CPU | C11 + OpenMP + SIMD → `gcc -O3 -march=native` → ctypes | full |
+| `c` | CPU | C11 + OpenMP + SIMD → `gcc -O3 -march=native`, run by the **C++ runtime** (pybind11, planned arena) | full |
+| `cuda` | NVIDIA GPU | generated **CUDA C++** → **NVRTC** → driver API launches, optional **CUDA-graph** replay; SIMT tiled GEMM + **WMMA Tensor-Core** GEMM | codegen type-checked in CI; execution tests need a GPU |
 | `triton` | NVIDIA GPU | generated Triton source (`tl.dot` on Tensor Cores) | full; runs under `TRITON_INTERPRET=1` on CPU |
-| `mlir` | CPU via LLVM | `linalg`/`tensor`/`arith` → `mlir-opt` pipeline → LLVM IR → `clang` | emission always; execution needs an MLIR toolchain |
+| `mlir` | CPU via LLVM | `linalg` emission → `mlir-opt` → LLVM → `clang`; plus a **C++ `tj` dialect** (TableGen ops, `tj-fuse`, `tj-lower-to-linalg`, `tj-opt`) | emission always; execution needs an MLIR toolchain |
 
 ```python
 import tensorjit as tj
@@ -35,12 +38,12 @@ compiled = torch.compile(model, backend=tj.torch_compile_backend)   # falls back
 
 ```
 Python tracer ──┐
-                ├─► SSA tensor IR ─► cleanup passes ─► fusion ─► row fusion ─► backend codegen ─► kernel cache
-FX (Dynamo) ────┘        │               │                │                           │
-                   static shapes     CSE, DCC,       elementwise chains        C / Triton / MLIR,
-                   + dtypes          algebraic,      matmul epilogues          tiles autotuned
-                                     broadcast &     reduce prologues          per shape
-                                     transpose       whole-row programs
+                ├─► SSA tensor IR ─► cleanup passes ─► fusion ─► row fusion ─► memory planner ─► backend codegen ─► runtime
+FX (Dynamo) ────┘        │               │                │                      │                   │                │
+                   static shapes     CSE, DCE,       elementwise chains    liveness ->        C / CUDA / Triton   C++ executor,
+                   + dtypes          algebraic,      matmul epilogues      one arena,         / MLIR; tiles       CUDA graph,
+                                     broadcast &     reduce prologues      offsets, 40-80%    autotuned           kernel cache
+                                     transpose       whole-row programs    less peak memory   per shape
                                      folding
 ```
 
@@ -63,12 +66,33 @@ kernels, so `broadcast_to` disappears), and **transpose-into-matmul folding**
   elementwise ops that broadcast their results back) collapse into one kernel —
   LayerNorm, RMSNorm and softmax each become a single pass over the row.
 
+**Memory planner** (`passes/memory_planner.py`): after fusion every intermediate
+has an interval lifetime over the kernel sequence, so buffers are assigned by
+greedy best-fit over free ranges of one arena (interval-graph colouring, as in
+XLA/TVM/Inductor). Verified non-overlapping; 82% peak reduction on a chained
+transformer block. Graph outputs stay outside the arena.
+
+**Runtime** (`csrc/runtime.cpp`, `runtime/native.py`): a pybind11 module that
+dlopens the C backend's shared object, pre-resolves every kernel argument to an
+input pointer / arena offset / output pointer, and runs the whole program with
+the GIL released — one C++ call per program instead of one Python round-trip per
+kernel. 3.3× lower per-call overhead on a 16-kernel graph (112 → 34 µs).
+
 **Backends** (`backends/`):
 - *C*: nested loops with constant bounds, `#pragma omp parallel for` over outer
   dims and `#pragma omp simd` on the innermost, register-blocked matmul
   microkernels (broadcast-FMA for `[K,N]` weights, dot-product form for `[N,K]`
   weights), a vectorisable `erf`, and per-thread scratch so matmul epilogues run
   as one contiguous SIMD pass per row.
+- *CUDA C++* (`cuda_backend.py`, `cuda_driver.py`): grid-stride elementwise
+  kernels; one-block-per-row kernels with warp-shuffle block reductions for
+  LayerNorm/softmax/RMSNorm; a 64×64×16 shared-memory tiled GEMM with 4×4
+  register micro-tiles and the fused epilogue in the store loop; a **WMMA
+  Tensor-Core** GEMM for fp16/bf16. Compiled at run time with **NVRTC** (ctypes
+  bindings, no build step), launched through the **driver API** on PyTorch's
+  stream, and optionally captured once into a **CUDA graph** with static
+  buffers so a call is a single `cuGraphLaunch`. Every generated program is
+  type-checked as host C++ in CI via `csrc/cuda_host_stub.h`.
 - *Triton*: 1-D flattened elementwise kernels with compile-time index
   decomposition, row kernels where the row lives in registers, and a tiled
   `tl.dot` matmul with the epilogue applied on the accumulator tile. Launch
@@ -77,7 +101,12 @@ kernels, so `broadcast_to` disappears), and **transpose-into-matmul folding**
   broadcasting affine maps, `linalg.transpose`, reductions as generics with
   `"reduction"` iterators; pipeline `linalg-fuse-elementwise-ops →
   one-shot-bufferize → convert-linalg-to-loops → … → llvm`, executed through the
-  C interface with ctypes memref descriptors.
+  C interface with ctypes memref descriptors. `emit_mlir(graph, dialect="tj")`
+  instead emits the high-level ops of the **C++ `tj` dialect** in [`mlir/`](mlir/):
+  TableGen-defined `tj.fused_matmul` / `tj.softmax` / `tj.layer_norm` /
+  `tj.rms_norm` with verifiers, a `tj-fuse` rewrite pass that folds
+  `linalg.matmul + bias + activation` into `tj.fused_matmul`, a
+  `tj-lower-to-linalg` pass, a `tj-opt` driver and lit/FileCheck tests.
 
 **Runtime** (`runtime/`): on-disk kernel cache keyed by source hash; a
 **cost-model-pruned autotuner** for matmul tiles (ranks candidates by tile
@@ -86,7 +115,24 @@ persists the winner to `~/.cache/tensorjit/autotune.json`); and a buffer pool
 that recycles intermediates and — using refcounts — output buffers the caller
 has dropped, which removes first-touch page-fault cost from every call.
 
-## Results (CPU, 2 cores, fp32, hidden=512)
+## Results
+
+Per-call overhead on a 16-kernel graph (CPU, `benchmarks/bench_overhead.py`):
+
+| executor | µs / call |
+|---|---|
+| torch eager | 119 |
+| tensorjit, Python executor | 112 |
+| tensorjit, **C++ runtime + planned arena** | **34** |
+
+GPU (fill in from `benchmarks/bench.py --device cuda --backend cuda` and `bench_overhead.py`):
+
+| workload | eager | inductor | tensorjit/triton | tensorjit/cuda | tensorjit/cuda + CUDA graph |
+|---|---|---|---|---|---|
+| mlp_block T=4096 | | | | | |
+| softmax 8×2048² | | | | | |
+
+CPU kernels (2 cores, fp32, hidden=512):
 
 | workload | seq | eager | tensorjit | kernels |
 |---|---|---|---|---|
@@ -106,23 +152,27 @@ and put the numbers here.
 
 ```bash
 pip install -e .                     # torch + a C compiler is all the C backend needs
-pytest -q                            # C backend, MLIR emission, torch.compile backend   (~50 tests)
+pytest -q                            # C backend + C++ runtime, planner, CUDA codegen (host-checked), MLIR, torch.compile (~85 tests)
 TRITON_INTERPRET=1 pytest -q tests/test_backends.py -k triton   # Triton codegen on CPU
+pytest -q tests/test_cuda_backend.py                              # on a GPU: NVRTC build, CUDA graph replay, WMMA GEMM
 TENSORJIT_DUMP=1 python examples/mlp.py                          # print IR after every pass
 ```
 
-Env knobs: `TENSORJIT_BACKEND=c|triton|mlir`, `TENSORJIT_NO_AUTOTUNE=1`,
-`TENSORJIT_NO_ROW_FUSION=1`, `TENSORJIT_STRICT=1` (torch.compile backend raises
-instead of falling back), `TENSORJIT_CACHE_DIR`.
+Env knobs: `TENSORJIT_BACKEND=c|cuda|triton|mlir`, `TENSORJIT_NATIVE_RUNTIME=0`
+(Python executor), `TENSORJIT_CUDA_GRAPH=0`, `TENSORJIT_CUDA_WMMA=0`,
+`TENSORJIT_NO_AUTOTUNE=1`, `TENSORJIT_NO_ROW_FUSION=1`, `TENSORJIT_STRICT=1`
+(torch.compile backend raises instead of falling back), `TENSORJIT_CACHE_DIR`.
 
 ## Layout
 
 ```
 tensorjit/ir         graph.py (IR, type inference, broadcasting)  printer.py
-tensorjit/passes     cleanup.py  fusion.py (+ row fusion)  pass_manager.py
-tensorjit/backends   common.py  c_backend.py  triton_backend.py  mlir_backend.py
-tensorjit/runtime    executor.py (buffer pool)  autotune.py (cost model)  cache.py
-tensorjit/frontend   tracer.py (Python API)  torch_backend.py (FX → IR)
+tensorjit/passes     cleanup.py  fusion.py (+ row fusion)  memory_planner.py  pass_manager.py
+tensorjit/backends   common.py  c_backend.py  cuda_backend.py  cuda_driver.py (NVRTC/driver ctypes)
+                     triton_backend.py  mlir_backend.py (linalg + tj emitters)
+tensorjit/runtime    native.py (C++ runtime binding)  executor.py (Python executor, buffer pool)  autotune.py  cache.py
+csrc/                runtime.cpp (pybind11 executor)  cuda_host_stub.h (host type-check of generated CUDA)
+mlir/                tj dialect: TableGen ops, dialect + passes (C++), tj-opt, CMake, lit tests
 tests/  benchmarks/  examples/
 ```
 

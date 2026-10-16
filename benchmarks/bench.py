@@ -78,13 +78,14 @@ def main():
     p.add_argument("--hidden", type=int, default=1024)
     p.add_argument("--workloads", nargs="+", default=list(WORKLOADS))
     p.add_argument("--no-inductor", action="store_true")
+    p.add_argument("--backend", default=None, help="tensorjit backend: c | triton | cuda (default: auto)")
     p.add_argument("--out", default="tensorjit_bench.csv")
     a = p.parse_args()
     dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[a.dtype]
     rows = []
     for name in a.workloads:
         tj_fn, torch_fn, shapes = WORKLOADS[name]
-        jf = tj.jit(tj_fn)
+        jf = tj.jit(tj_fn, backend=a.backend)
         ind = None if a.no_inductor else torch.compile(torch_fn)
         for T in a.seq:
             args = [torch.randn(*s, device=a.device, dtype=dtype) for s in shapes(T, a.hidden)]
