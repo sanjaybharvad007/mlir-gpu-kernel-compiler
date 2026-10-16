@@ -120,6 +120,7 @@ class Node:
     attrs: dict[str, Any] = field(default_factory=dict)
     name: str = ""
     users: list["Node"] = field(default_factory=list, repr=False)
+    meta: dict[str, Any] = field(default_factory=dict, repr=False)   # non-semantic (ignored by CSE / signature)
 
     def __post_init__(self):
         if not self.name:

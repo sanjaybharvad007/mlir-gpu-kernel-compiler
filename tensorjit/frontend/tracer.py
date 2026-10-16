@@ -166,11 +166,18 @@ def broadcast_to(x: Tensor, shape) -> Tensor:
 
 
 # -- composite ops (expressed in primitives; fusion takes care of the rest) ----
+def _composite(root: Tensor, op: str, args: list, **params) -> Tensor:
+    """Tag the root node of a composite so the MLIR `tj` emitter can print it
+    as one high-level op (``tj.softmax`` etc.) instead of its expansion."""
+    root.node.meta["composite"] = {"op": op, "args": [a.node for a in args if a is not None], **params}
+    return root
+
+
 def softmax(x: Tensor, axis: int = -1) -> Tensor:
     assert axis in (-1, x.ndim - 1), "softmax over last axis"
     m = reduce("max", x, -1, keepdim=True)
     e = exp(x - m)
-    return e / reduce("sum", e, -1, keepdim=True)
+    return _composite(e / reduce("sum", e, -1, keepdim=True), "softmax", [x])
 
 
 def layer_norm(x: Tensor, weight: Tensor | None = None, bias: Tensor | None = None, eps: float = 1e-5) -> Tensor:
@@ -182,19 +189,21 @@ def layer_norm(x: Tensor, weight: Tensor | None = None, bias: Tensor | None = No
         y = y * weight
     if bias is not None:
         y = y + bias
-    return y
+    return _composite(y, "layer_norm", [x, weight, bias], eps=eps, has_weight=weight is not None, has_bias=bias is not None)
 
 
 def rms_norm(x: Tensor, weight: Tensor | None = None, eps: float = 1e-6) -> Tensor:
     ms = reduce("mean", x * x, -1, keepdim=True)
     y = x * rsqrt(ms + eps)
-    return y * weight if weight is not None else y
+    y = y * weight if weight is not None else y
+    return _composite(y, "rms_norm", [x, weight], eps=eps, has_weight=weight is not None)
 
 
 def linear(x: Tensor, w: Tensor, b: Tensor | None = None) -> Tensor:
     """x @ w.T + b, PyTorch nn.Linear convention (w: [out, in])."""
     y = matmul(x, w.T)
-    return y + b if b is not None else y
+    y = y + b if b is not None else y
+    return _composite(y, "linear", [x, w, b], has_bias=b is not None)
 
 
 # -- tracing ----------------------------------------------------------------------

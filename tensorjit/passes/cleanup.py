@@ -103,8 +103,8 @@ def algebraic_simplify(g: Graph) -> bool:
                 new = a
             elif n.op == "mul" and _is_const(a, 1.0) and b.shape == n.shape:
                 new = b
-            elif n.op == "mul" and (_is_const(a, 0.0) or _is_const(b, 0.0)):
-                new = g.const(0.0, n.dtype, n.shape)
+            elif n.op == "mul" and (_is_const(a, 0.0) or _is_const(b, 0.0)) and n.shape == ():
+                new = g.const(0.0, n.dtype, n.shape)   # non-scalar zeros stay a kernel: backends take scalar consts only
             if new is not None:
                 _replace(g, n, new)
                 changed = True
