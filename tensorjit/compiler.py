@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import threading
 import time
@@ -15,7 +16,9 @@ from .ir import Graph
 from .passes import Program, fuse, optimize, row_fuse
 from .runtime import CompiledProgram
 
-BACKENDS = ("c", "triton", "mlir")
+log = logging.getLogger("tensorjit")
+
+BACKENDS = ("c", "triton", "mlir", "cuda")
 
 
 def pick_backend(device: str, requested: str | None = None) -> str:
@@ -28,7 +31,7 @@ def pick_backend(device: str, requested: str | None = None) -> str:
     return "c"
 
 
-ROW_FUSION_MAX_N = {"c": None, "triton": 8192, "mlir": None}
+ROW_FUSION_MAX_N = {"c": None, "triton": 8192, "cuda": 8192, "mlir": None}
 
 
 def lower(graph: Graph, backend: str = "c") -> Program:
@@ -44,11 +47,25 @@ def compile_graph(graph: Graph, backend: str, device: str = "cpu", tune: bool = 
     if backend == "c":
         from .backends import c_backend
 
-        return c_backend.compile_program(program, tune=tune)
+        cp = c_backend.compile_program(program, tune=tune)
+        if os.environ.get("TENSORJIT_NATIVE_RUNTIME", "1") == "1":
+            try:
+                from .runtime.native import NativeProgram
+
+                native = NativeProgram(program, cp.so_path, cp.symbols)
+                native.source, native.matmul_configs = cp.source, cp.matmul_configs
+                return native
+            except Exception as e:  # no C++ compiler / pybind11: keep the Python executor
+                log.warning("native runtime unavailable, using Python executor (%s)", e)
+        return cp
     if backend == "triton":
         from .backends import triton_backend
 
         return triton_backend.compile_program(program, device=device, tune=tune)
+    if backend == "cuda":
+        from .backends import cuda_backend
+
+        return cuda_backend.compile_program(program, device=device, tune=tune)
     if backend == "mlir":
         from .backends import mlir_backend
 

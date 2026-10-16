@@ -84,6 +84,9 @@ C_EXPR = {
     "where": "(({0}) != 0.0f ? ({1}) : ({2}))",
 }
 
+# CUDA device code: same as C but with the hardware erf (no vectorisation concern).
+CUDA_EXPR = dict(C_EXPR, gelu="(0.5f * {0} * (1.0f + erff({0} * 0.70710678118654752f)))")
+
 TRITON_EXPR = {
     "neg": "(-{0})",
     "exp": "tl.exp({0})",
@@ -109,16 +112,16 @@ TRITON_EXPR = {
 
 def scalar_literal(v: float, lang: str) -> str:
     if v != v:  # nan
-        return "NAN" if lang == "c" else "float('nan')"
+        return "NAN" if lang in ("c", "cuda") else "float('nan')"
     if v in (float("inf"), float("-inf")):
-        s = "INFINITY" if lang == "c" else "float('inf')"
+        s = "INFINITY" if lang in ("c", "cuda") else "float('inf')"
         return f"(-{s})" if v < 0 else s
-    return f"{v!r}f" if lang == "c" else repr(float(v))
+    return f"{v!r}f" if lang in ("c", "cuda") else repr(float(v))
 
 
 def emit_expr(node: Node, operand: dict[int, str], lang: str) -> str:
     """Expression for one elementwise node given operand names."""
-    table = C_EXPR if lang == "c" else TRITON_EXPR
+    table = {"c": C_EXPR, "cuda": CUDA_EXPR, "triton": TRITON_EXPR}[lang]
     args = []
     for i in node.inputs:
         if i.op == "const" and i.shape == ():
