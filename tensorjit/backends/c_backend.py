@@ -391,6 +391,7 @@ def compile_program(program: Program, tune: bool = True) -> CompiledProgram:
 
     # Autotune matmuls on real buffers, then bind the winner.
     fns: dict[int, object] = {}
+    symbols: dict[int, str] = {}
     for g, key, (M, N, K), kind in tune_jobs:
         k = g.k
         ins = [torch.randn(i.shape) for i in k.inputs]
@@ -404,11 +405,14 @@ def compile_program(program: Program, tune: bool = True) -> CompiledProgram:
         cfg = autotune(key, C_CANDIDATES, build, (M, N, K), kind, store=store)
         chosen[g.idx] = cfg
         fns[g.idx] = _make_fn(lib, f"kernel_{g.idx}_v{C_CANDIDATES.index(cfg)}")
+        symbols[g.idx] = f"kernel_{g.idx}_v{C_CANDIDATES.index(cfg)}"
 
     kernel_fns = [fns.get(g.idx) or _make_fn(lib, f"kernel_{g.idx}") for g in gens]
     cp = CompiledProgram(program, kernel_fns, "cpu", "c")
     cp.source = "\n\n".join(sources)  # type: ignore[attr-defined]
     cp.matmul_configs = chosen  # type: ignore[attr-defined]
+    cp.so_path = lib._name  # type: ignore[attr-defined]
+    cp.symbols = [symbols.get(g.idx, f"kernel_{g.idx}") for g in gens]  # type: ignore[attr-defined]
     return cp
 
 
